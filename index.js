@@ -1,8 +1,33 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
+import webpush from "web-push";
+import Anthropic from "@anthropic-ai/sdk";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+webpush.setVapidDetails(
+  "mailto:efyanaomi18@gmail.com",
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY
+);
+
+async function sendPushToAllDevices(userId, title, body) {
+  const { data: subs } = await supabase.from("push_subscriptions").select("*").eq("user_id", userId);
+  const payload = JSON.stringify({ title, body, url: process.env.APP_URL || "/" });
+  await Promise.allSettled(
+    (subs || []).map(async (row) => {
+      try {
+        await webpush.sendNotification(row.subscription, payload);
+      } catch (err) {
+        if (err.statusCode === 410 || err.statusCode === 404) {
+          await supabase.from("push_subscriptions").delete().eq("id", row.id);
+        }
+      }
+    })
+  );
+}
 
 function daysUntil(dateStr) {
   const today = new Date();
@@ -17,8 +42,10 @@ function daysSince(dateStr) {
 }
 
 async function buildDigest() {
+  // Active tasks
   const { data: tasks } = await supabase.from("tasks").select("*").eq("done", false);
 
+  // Upcoming things across the app, same idea as the in-app Reminders page
   const { data: events } = await supabase.from("events").select("*");
   const { data: courses } = await supabase.from("education_courses").select("*").neq("status", "done");
   const { data: loveDates } = await supabase.from("love_dates").select("*");
@@ -34,23 +61,75 @@ async function buildDigest() {
     .filter((i) => i.days >= 0 && i.days <= 7)
     .sort((a, b) => a.days - b.days);
 
+  // Last activity, using the most recent row across a few tables as a proxy
   const { data: lastTask } = await supabase.from("tasks").select("created_at").order("created_at", { ascending: false }).limit(1).maybeSingle();
   const { data: lastJournal } = await supabase.from("journal_entries").select("created_at").order("created_at", { ascending: false }).limit(1).maybeSingle();
   const lastActivity = [lastTask?.created_at, lastJournal?.created_at].filter(Boolean).sort().reverse()[0];
   const inactiveDays = lastActivity ? daysSince(lastActivity) : null;
 
-  return { tasks: tasks || [], upcoming, inactiveDays };
+  // Broader life signals, so the check-in can ask about more than just tasks
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const { count: tasksAddedToday } = await supabase
+    .from("tasks")
+    .select("*", { count: "exact", head: true })
+    .gte("created_at", todayStart.toISOString());
+
+  const { data: sleepLogs } = await supabase.from("sleep_log").select("created_at").order("created_at", { ascending: false }).limit(1);
+  const hoursSinceSleep = sleepLogs?.[0] ? (Date.now() - new Date(sleepLogs[0].created_at)) / 3600000 : null;
+
+  const { data: entertainment } = await supabase.from("entertainment_items").select("created_at").order("created_at", { ascending: false }).limit(1);
+  const daysSinceWatching = entertainment?.[0] ? daysSince(entertainment[0].created_at) : null;
+
+  const { data: careerApps } = await supabase.from("career_apps").select("created_at, status").order("created_at", { ascending: false }).limit(1);
+  const daysSinceApplication = careerApps?.[0] ? daysSince(careerApps[0].created_at) : null;
+
+  return {
+    tasks: tasks || [],
+    upcoming,
+    inactiveDays,
+    tasksAddedToday: tasksAddedToday || 0,
+    hoursSinceSleep,
+    daysSinceWatching,
+    daysSinceApplication,
+  };
 }
 
-function shouldSend({ tasks, upcoming, inactiveDays }) {
-  return tasks.length > 0 || upcoming.length > 0 || (inactiveDays !== null && inactiveDays >= 2);
-}
-
-function renderEmail({ tasks, upcoming, inactiveDays }) {
-  const lines = [];
-  if (inactiveDays !== null && inactiveDays >= 2) {
-    lines.push(`It's been ${inactiveDays} days since you last checked in.`);
+// Picks ONE thing worth gently asking about or celebrating this run, varies each time,
+// keeps it warm rather than naggy. Cheap model, short output, called every run.
+async function generateNudge(digest) {
+  try {
+    const message = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 150,
+      system: `You write ONE short, warm line for a check-in notification inside Naomi's personal app NAOMI.
+You're given a JSON snapshot of her day. Pick the single most interesting or relevant thing to say right now,
+varying your angle across runs rather than always picking the same signal. Consider, in no fixed order:
+- if tasksAddedToday is 0, gently ask what's on her mind today or why nothing's been added
+- if hoursSinceSleep is null or over 30, ask if she's logged her sleep
+- if daysSinceWatching is null or over 10, ask if she's watched anything good lately
+- if daysSinceApplication is null or over 14, nudge about whether any applications are moving
+- if tasks.length is high (8+), acknowledge she has a lot open and offer encouragement
+- if nothing stands out, just offer a short warm line of encouragement, no data needed
+Respond with ONLY the line itself, one or two sentences, no quotes, no preamble, no label. Warm and specific,
+like a friend checking in, never guilt-tripping or robotic. Vary sentence structure and opening words across calls.`,
+      messages: [{ role: "user", content: JSON.stringify(digest) }],
+    });
+    return message.content[0]?.text?.trim() || "";
+  } catch (err) {
+    console.error("Nudge generation failed:", err);
+    return "";
   }
+}
+
+function shouldSend() {
+  // Naomi wants regular varied check-ins now, not just when something's overdue
+  return true;
+}
+
+function renderEmail({ tasks, upcoming, nudge }) {
+  const lines = [];
+  if (nudge) lines.push(nudge);
   if (tasks.length > 0) {
     lines.push(`\nOpen tasks (${tasks.length}):`);
     tasks.slice(0, 8).forEach((t) => lines.push(`  - ${t.text}`));
@@ -64,10 +143,10 @@ function renderEmail({ tasks, upcoming, inactiveDays }) {
 }
 
 function esc(str) {
-  return String(str).replace(/[&<>"'']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function renderEmailHtml({ tasks, upcoming, inactiveDays }) {
+function renderEmailHtml({ tasks, upcoming, nudge }) {
   const appUrl = process.env.APP_URL || "#";
 
   const taskRows = tasks
@@ -96,9 +175,9 @@ function renderEmailHtml({ tasks, upcoming, inactiveDays }) {
     .join("");
 
   const inactiveBanner =
-    inactiveDays !== null && inactiveDays >= 2
+    nudge
       ? `<p style="margin:0 0 24px;padding:14px 18px;background:#F3D9CE;border-radius:12px;color:#5C4433;font-size:14px;">
-           It's been ${inactiveDays} days since you last checked in.
+           ${esc(nudge)}
          </p>`
       : "";
 
@@ -143,10 +222,13 @@ function renderEmailHtml({ tasks, upcoming, inactiveDays }) {
 async function main() {
   const digest = await buildDigest();
 
-  if (!shouldSend(digest)) {
+  if (!shouldSend()) {
     console.log("Nothing worth sending today, skipping.");
     return;
   }
+
+  const nudge = await generateNudge(digest);
+  const digestWithNudge = { ...digest, nudge };
 
   const transporter = nodemailer.createTransport({
     service: "gmail",
@@ -160,11 +242,21 @@ async function main() {
     from: `NAOMI <${process.env.GMAIL_USER}>`,
     to: process.env.RECIPIENT_EMAIL,
     subject: "Your check-in from NAOMI",
-    text: renderEmail(digest),
-    html: renderEmailHtml(digest),
+    text: renderEmail(digestWithNudge),
+    html: renderEmailHtml(digestWithNudge),
   });
 
   console.log("Digest email sent.");
+
+  // Also send a real push notification, to whichever device(s) have subscribed
+  const { data: anySub } = await supabase.from("push_subscriptions").select("user_id").limit(1).maybeSingle();
+  if (anySub) {
+    const pushBody = nudge || `${digest.tasks.length} tasks, ${digest.upcoming.length} things coming up this week.`;
+    await sendPushToAllDevices(anySub.user_id, "Your check-in from NAOMI", pushBody);
+    console.log("Push notification sent.");
+  } else {
+    console.log("No push subscription on file yet, skipping push.");
+  }
 }
 
 main().catch((err) => {

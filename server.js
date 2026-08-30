@@ -2,15 +2,70 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import Anthropic from "@anthropic-ai/sdk";
+import webpush from "web-push";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+webpush.setVapidDetails(
+  "mailto:efyanaomi18@gmail.com",
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY
+);
 
 app.get("/", (req, res) => {
   res.send("Naomi AI server is running.");
+});
+
+// Save a device's push subscription so we can reach it later
+app.post("/api/save-subscription", async (req, res) => {
+  const { subscription, user_id } = req.body;
+  if (!subscription || !user_id) {
+    return res.status(400).json({ error: "Missing subscription or user_id" });
+  }
+  try {
+    await supabase.from("push_subscriptions").insert({ subscription, user_id });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Save subscription failed:", err);
+    res.status(500).json({ error: "Failed to save subscription" });
+  }
+});
+
+// Send a real push notification to every device this user has registered
+app.post("/api/send-push", async (req, res) => {
+  const { user_id, title, body, url } = req.body;
+  if (!user_id) {
+    return res.status(400).json({ error: "Missing user_id" });
+  }
+  try {
+    const { data: subs } = await supabase.from("push_subscriptions").select("*").eq("user_id", user_id);
+    const payload = JSON.stringify({ title: title || "NAOMI", body: body || "", url: url || "/" });
+
+    const results = await Promise.allSettled(
+      (subs || []).map(async (row) => {
+        try {
+          await webpush.sendNotification(row.subscription, payload);
+        } catch (err) {
+          // A 410 means the device unsubscribed or the browser data was cleared, clean it up
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            await supabase.from("push_subscriptions").delete().eq("id", row.id);
+          }
+          throw err;
+        }
+      })
+    );
+
+    res.json({ sent: results.filter((r) => r.status === "fulfilled").length, total: results.length });
+  } catch (err) {
+    console.error("Send push failed:", err);
+    res.status(500).json({ error: "Failed to send push" });
+  }
 });
 
 // Brain Dump: takes a messy sentence, returns a clean, categorized suggestion
