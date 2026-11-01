@@ -2,7 +2,7 @@ name: Naomi digest
 
 on:
   schedule:
-    - cron: "0 7,12,17,21 * * *"
+    - cron: "0 8,18 * * *"
   workflow_dispatch:
 
 jobs:
@@ -12,8 +12,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - run: npm install
+      - name: Clean VAPID keys
+        run: |
+          echo "VAPID_PUBLIC_KEY=$(printf '%s' "$RAW_PUB" | sed 's/^VAPID_PUBLIC_KEY=//' | tr -d '"=[:space:]')" >> "$GITHUB_ENV"
+          echo "VAPID_PRIVATE_KEY=$(printf '%s' "$RAW_PRIV" | sed 's/^VAPID_PRIVATE_KEY=//' | tr -d '"=[:space:]')" >> "$GITHUB_ENV"
+        env:
+          RAW_PUB: ${{ secrets.VAPID_PUBLIC_KEY }}
+          RAW_PRIV: ${{ secrets.VAPID_PRIVATE_KEY }}
       - run: node index.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -23,5 +30,3 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           APP_URL: ${{ secrets.APP_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          VAPID_PUBLIC_KEY: ${{ secrets.VAPID_PUBLIC_KEY }}
-          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
