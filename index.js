@@ -59,11 +59,20 @@ async function buildDigest() {
   const { data: loveDates } = await supabase.from("love_dates").select("*");
   const { data: milestones } = await supabase.from("timeline_milestones").select("*");
 
+  // Application deadlines (ignored quietly if the deadline column does not exist yet)
+  const { data: appDeadlines } = await supabase
+    .from("career_apps")
+    .select("org, deadline, status")
+    .not("deadline", "is", null);
+
   const upcoming = [
     ...(events || []).map((e) => ({ label: e.title, date: e.date, source: "Home" })),
     ...(courses || []).filter((c) => c.exam_date).map((c) => ({ label: c.name, date: c.exam_date, source: "Education" })),
     ...(loveDates || []).map((d) => ({ label: d.label, date: d.date, source: "Love Life" })),
     ...(milestones || []).map((m) => ({ label: m.title, date: m.date, source: "Timeline" })),
+    ...(appDeadlines || [])
+      .filter((a) => a.status !== "offer" && a.status !== "rejected")
+      .map((a) => ({ label: a.org + " application deadline", date: a.deadline, source: "Applications" })),
   ]
     .map((i) => ({ ...i, days: daysUntil(i.date) }))
     .filter((i) => i.days >= 0 && i.days <= 7)
@@ -94,20 +103,52 @@ async function buildDigest() {
   };
 }
 
+async function countSince(table, since, extra) {
+  let q = supabase.from(table).select("*", { count: "exact", head: true }).gte("created_at", since);
+  if (extra) q = extra(q);
+  const { count } = await q;
+  return count || 0;
+}
+
+// A look back at the last 7 days, used for the Sunday weekly review
+async function buildWeekly() {
+  const since = new Date(Date.now() - 7 * 86400000).toISOString();
+  const [tasksAdded, journalEntries, sleepNights, memoriesAdded, applicationsAdded] = await Promise.all([
+    countSince("tasks", since),
+    countSince("journal_entries", since),
+    countSince("sleep_log", since),
+    countSince("memories", since),
+    countSince("career_apps", since),
+  ]);
+  const { data: wins } = await supabase.from("wins").select("text").gte("created_at", since).order("created_at", { ascending: false }).limit(5);
+  return {
+    tasksAdded,
+    journalEntries,
+    sleepNights,
+    memoriesAdded,
+    applicationsAdded,
+    wins: (wins || []).map((w) => w.text).filter(Boolean),
+  };
+}
+
 // Decides if anything is worth sending right now. Returns null when nothing is.
-// Morning run (before 12:00 UTC): event reminders at 3 days, 1 day and 0 days.
-// Evening run: a check in if she has been quiet for 2+ days, every second day.
+// Morning run (before 12:00 UTC): event and deadline reminders at 3 days, 1 day and 0 days.
+// Evening run: a Sunday weekly review, otherwise a check in if she has been quiet for 2+ days.
 function decideReason(digest, manual) {
-  const morning = new Date().getUTCHours() < 12;
+  const now = new Date();
+  const morning = now.getUTCHours() < 12;
+  const sundayEvening = now.getUTCDay() === 0 && !morning;
   const dueEvents = digest.upcoming.filter((u) => [0, 1, 3].includes(u.days));
   const away = digest.inactiveDays !== null && digest.inactiveDays >= 2 && digest.inactiveDays % 2 === 0;
 
   if (manual) {
+    if (process.env.MODE === "weekly") return { type: "weekly" };
     if (dueEvents.length > 0) return { type: "event", events: dueEvents };
     if (away) return { type: "checkin" };
     return { type: "test" };
   }
   if (morning && dueEvents.length > 0) return { type: "event", events: dueEvents };
+  if (sundayEvening) return { type: "weekly" };
   if (!morning && away) return { type: "checkin" };
   return null;
 }
@@ -122,12 +163,20 @@ function whenWord(days) {
 
 async function generateMessage(digest, reason) {
   const style = STYLES[Math.floor(Math.random() * STYLES.length)];
+  let maxChars = 220;
+  let sentences = "one or two sentences";
 
   let context;
   if (reason.type === "event") {
     context =
       "Remind her about these coming up items. days is how far away: 0 is today, 1 is tomorrow. Name them specifically: " +
       JSON.stringify(reason.events.map((e) => ({ label: e.label, days: e.days })));
+  } else if (reason.type === "weekly") {
+    maxChars = 450;
+    sentences = "three or four sentences";
+    context =
+      "This is her Sunday evening weekly review. Look back on her week using the weekly numbers loosely (never list them like a report), mention her best win if there is one, " +
+      "gently point at the week ahead using the upcoming items if any, and end with one reflective question she can answer in her journal.";
   } else if (reason.type === "checkin") {
     context =
       "She has not added or logged anything in the app for " + digest.inactiveDays +
@@ -142,21 +191,34 @@ async function generateMessage(digest, reason) {
           subject: "Coming up " + whenWord(reason.events[0].days),
           line: reason.events.map((e) => e.label + " is " + whenWord(e.days)).join(". ") + ".",
         }
+      : reason.type === "weekly"
+      ? { subject: "Your week in review", line: "Another week done. Take a moment tonight to notice what you got through, and be kind to yourself going into the next one." }
       : { subject: "Thinking of you", line: "Hey you. How are you doing today?" };
+
+  const snapshot = {
+    openTasks: digest.tasks.length,
+    sampleTasks: digest.tasks.slice(0, 5).map((t) => t.text),
+    upcoming: digest.upcoming.map((u) => ({ label: u.label, days: u.days })),
+    inactiveDays: digest.inactiveDays,
+    hoursSinceSleep: digest.hoursSinceSleep,
+    daysSinceWatching: digest.daysSinceWatching,
+    daysSinceApplication: digest.daysSinceApplication,
+    weekly: digest.weekly || null,
+  };
 
   try {
     const message = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 250,
+      max_tokens: 400,
       system:
         "You write one short notification for Naomi inside her personal app NAOMI.\n" +
         "Style for this message: " + style + ".\n" +
         context + "\n" +
-        "Rules: one or two sentences, 220 characters at most. Never use hyphens or dashes of any kind. " +
-        "Never guilt trip, never sound robotic, never mention data fields or numbers like they are a report. " +
+        "Rules: " + sentences + ", " + maxChars + " characters at most. Never use hyphens or dashes of any kind. " +
+        "Never guilt trip, never sound robotic, never mention data fields. " +
         "The subject is under 50 characters, varied every time, and does not have to include the word NAOMI or check in.\n" +
         'Respond with ONLY JSON in this exact shape, no markdown: {"subject":"...","line":"..."}',
-      messages: [{ role: "user", content: JSON.stringify({ snapshot: digest }) }],
+      messages: [{ role: "user", content: JSON.stringify({ snapshot }) }],
     });
     const raw = message.content[0]?.text?.trim() || "{}";
     const parsed = JSON.parse(raw.replace(/^```json\s*/i, "").replace(/```$/, "").trim());
@@ -174,8 +236,19 @@ function esc(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function renderEmail({ tasks, upcoming, msg, showTasks }) {
+function renderEmail({ tasks, upcoming, msg, showTasks, weekly }) {
   const lines = [msg.line];
+  if (weekly) {
+    lines.push("\nYour week:");
+    lines.push("  \u2022 Tasks added: " + weekly.tasksAdded);
+    lines.push("  \u2022 Journal entries: " + weekly.journalEntries);
+    lines.push("  \u2022 Nights of sleep logged: " + weekly.sleepNights);
+    lines.push("  \u2022 Memories added: " + weekly.memoriesAdded);
+    if (weekly.wins.length > 0) {
+      lines.push("\nWins:");
+      weekly.wins.forEach((w) => lines.push("  \u2022 " + w));
+    }
+  }
   if (showTasks && tasks.length > 0) {
     lines.push("\nOpen tasks (" + tasks.length + "):");
     tasks.slice(0, 5).forEach((t) => lines.push("  \u2022 " + t.text));
@@ -188,7 +261,7 @@ function renderEmail({ tasks, upcoming, msg, showTasks }) {
   return lines.join("\n");
 }
 
-function renderEmailHtml({ tasks, upcoming, msg, showTasks }) {
+function renderEmailHtml({ tasks, upcoming, msg, showTasks, weekly }) {
   const appUrl = process.env.APP_URL || "#";
 
   const taskRows = tasks
@@ -228,6 +301,30 @@ function renderEmailHtml({ tasks, upcoming, msg, showTasks }) {
          <table width="100%" cellpadding="0" cellspacing="0">${upcomingRows}</table>`
       : "";
 
+  const stat = (n, label) => `
+        <td style="text-align:center;padding:12px 4px;background:#FBF6EF;border-radius:12px;">
+          <div style="font-size:22px;color:#2E241C;">${n}</div>
+          <div style="font-size:10px;color:#9A8A76;font-family:Arial,sans-serif;">${esc(label)}</div>
+        </td>`;
+
+  const weeklySection = weekly
+    ? `<p style="margin:28px 0 8px;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#6B5A48;">Your week</p>
+       <table width="100%" cellpadding="0" cellspacing="6"><tr>
+         ${stat(weekly.tasksAdded, "Tasks added")}
+         ${stat(weekly.journalEntries, "Journal")}
+         ${stat(weekly.sleepNights, "Nights logged")}
+         ${stat(weekly.memoriesAdded, "Memories")}
+       </tr></table>
+       ${
+         weekly.wins.length > 0
+           ? `<p style="margin:24px 0 8px;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#6B5A48;">Wins</p>
+              <table width="100%" cellpadding="0" cellspacing="0">${weekly.wins
+                .map((w) => `<tr><td style="padding:8px 0;border-bottom:1px solid #EEE0CE;font-size:14px;color:#2E241C;">${esc(w)}</td></tr>`)
+                .join("")}</table>`
+           : ""
+       }`
+    : "";
+
   return `
   <div style="background:#FBF6EF;padding:40px 16px;font-family:Georgia,'Times New Roman',serif;">
     <div style="max-width:480px;margin:0 auto;background:#FFFFFF;border-radius:20px;padding:36px 32px;border:1px solid #EEE0CE;">
@@ -243,6 +340,7 @@ function renderEmailHtml({ tasks, upcoming, msg, showTasks }) {
         ${esc(msg.line)}
       </p>
 
+      ${weeklySection}
       ${upcomingSection}
       ${tasksSection}
 
@@ -264,13 +362,17 @@ async function main() {
   }
   console.log("Sending because: " + reason.type);
 
+  const weekly = reason.type === "weekly" ? await buildWeekly() : null;
+  if (weekly) digest.weekly = weekly;
+
   const msg = await generateMessage(digest, reason);
   const isEvent = reason.type === "event";
   const payload = {
     tasks: digest.tasks,
     upcoming: isEvent ? reason.events : digest.upcoming,
     msg,
-    showTasks: !isEvent,
+    showTasks: !isEvent && !weekly,
+    weekly,
   };
 
   const transporter = nodemailer.createTransport({

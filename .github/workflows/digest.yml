@@ -4,6 +4,14 @@ on:
   schedule:
     - cron: "0 8,18 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto, or weekly to preview the Sunday review"
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - weekly
 
 jobs:
   send:
@@ -23,6 +31,7 @@ jobs:
           RAW_PRIV: ${{ secrets.VAPID_PRIVATE_KEY }}
       - run: node index.js
         env:
+          MODE: ${{ github.event.inputs.mode }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
